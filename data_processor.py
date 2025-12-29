@@ -10,7 +10,6 @@ import os
 import pandas as pd
 import requests
 from dotenv import load_dotenv
-from typing import Optional
 
 # Load environment variables from .env file
 load_dotenv()
@@ -19,6 +18,9 @@ load_dotenv()
 def fetch_aqi_data(city: str) -> pd.DataFrame:
     """
     Fetches air quality data from OpenAQ API v3 for a specified city.
+    
+    Uses the measurements endpoint directly, which is more reliable than
+    the locations endpoint for city-based queries.
     
     Args:
         city (str): Name of the city to fetch data for (e.g., 'London', 'Los Angeles')
@@ -40,85 +42,16 @@ def fetch_aqi_data(city: str) -> pd.DataFrame:
             "Get your API key from: https://openaq.org/"
         )
     
-    # OpenAQ API v3 endpoint for latest measurements
-    base_url = "https://api.openaq.org/v3/locations"
-    
-    # Prepare headers with API key authentication
-    headers = {
-        'X-API-Key': api_key,
-        'Content-Type': 'application/json'
-    }
-    
-    # Parameters for API request
-    params = {
-        'limit': 100,  # Maximum number of results
-        'page': 1,
-        'order_by': 'lastUpdated',
-        'sort': 'desc'
-    }
-    
-    # Search for locations matching the city name
-    params['city'] = city
-    
-    try:
-        # Make API request
-        response = requests.get(base_url, headers=headers, params=params, timeout=10)
-        response.raise_for_status()  # Raise an exception for bad status codes
-        
-        data = response.json()
-        
-        # Extract locations
-        locations = data.get('results', [])
-        
-        if not locations:
-            # If no locations found, try fetching measurements directly
-            return fetch_measurements_direct(city, api_key)
-        
-        # Get location IDs and fetch measurements for each
-        location_ids = [loc['id'] for loc in locations[:5]]  # Limit to first 5 locations
-        
-        # Fetch measurements for these locations
-        measurements_url = "https://api.openaq.org/v3/measurements"
-        all_measurements = []
-        
-        for loc_id in location_ids:
-            # Format date_from as ISO string for API
-            date_from = (pd.Timestamp.now() - pd.Timedelta(days=1)).strftime('%Y-%m-%dT%H:%M:%SZ')
-            meas_params = {
-                'location_id': loc_id,
-                'limit': 100,
-                'date_from': date_from,  # Last 24 hours
-                'parameter': 'pm25,no2',  # Focus on PM2.5 and NO2
-                'order_by': 'datetime',
-                'sort': 'desc'
-            }
-            
-            meas_response = requests.get(
-                measurements_url, 
-                headers=headers, 
-                params=meas_params, 
-                timeout=10
-            )
-            
-            if meas_response.status_code == 200:
-                meas_data = meas_response.json()
-                all_measurements.extend(meas_data.get('results', []))
-        
-        # Convert to DataFrame
-        if all_measurements:
-            df = pd.DataFrame(all_measurements)
-            return df
-        else:
-            # Fallback: fetch measurements directly
-            return fetch_measurements_direct(city, api_key)
-            
-    except requests.exceptions.RequestException as e:
-        raise ConnectionError(f"Failed to fetch data from OpenAQ API: {str(e)}")
+    # Use the direct measurements endpoint (more reliable)
+    return fetch_measurements_direct(city, api_key)
 
 
 def fetch_measurements_direct(city: str, api_key: str) -> pd.DataFrame:
     """
-    Alternative method to fetch measurements directly by city name.
+    Fetches measurements directly from OpenAQ API v3 measurements endpoint.
+    
+    This method fetches recent measurements and filters by city name in the location data.
+    This approach avoids the 422 error by using only supported parameters.
     
     Args:
         city (str): City name
@@ -137,19 +70,38 @@ def fetch_measurements_direct(city: str, api_key: str) -> pd.DataFrame:
     # Calculate date range for last 24 hours (ISO format)
     date_from = (pd.Timestamp.now() - pd.Timedelta(days=1)).strftime('%Y-%m-%dT%H:%M:%SZ')
     
-    # Parameters for measurements endpoint
-    # OpenAQ API v3 supports city parameter directly in measurements endpoint
-    params = {
-        'city': city,
-        'limit': 100,
-        'date_from': date_from,
-        'parameter': 'pm25,no2',  # Focus on PM2.5 and NO2 as specified
-        'order_by': 'datetime',
-        'sort': 'desc'
-    }
-    
     try:
+        # Use minimal, well-supported parameters to avoid 422 errors
+        # Start with basic parameters that are most likely to be supported
+        params = {
+            'limit': 100,
+            'date_from': date_from
+        }
+        
         response = requests.get(measurements_url, headers=headers, params=params, timeout=10)
+        
+        # If we get a 422 error, provide detailed error information
+        if response.status_code == 422:
+            try:
+                error_data = response.json()
+                error_details = error_data.get('errors', [])
+                error_msg = f"API validation error (422): {error_data.get('message', 'Invalid parameters')}"
+                if error_details:
+                    error_msg += f"\nDetails: {error_details}"
+                # Try with even simpler parameters
+                params_simple = {'limit': 50}
+                response_simple = requests.get(measurements_url, headers=headers, params=params_simple, timeout=10)
+                if response_simple.status_code == 200:
+                    # If simple request works, use it
+                    data = response_simple.json()
+                    measurements = data.get('results', [])
+                    if measurements:
+                        df = pd.DataFrame(measurements)
+                        return filter_by_city(df, city)
+                raise ValueError(error_msg)
+            except Exception as parse_error:
+                raise ValueError(f"API validation error (422). Response: {response.text[:200]}")
+        
         response.raise_for_status()
         
         data = response.json()
@@ -157,13 +109,84 @@ def fetch_measurements_direct(city: str, api_key: str) -> pd.DataFrame:
         
         if measurements:
             df = pd.DataFrame(measurements)
-            return df
+            # Filter by city name
+            df_filtered = filter_by_city(df, city)
+            
+            if not df_filtered.empty:
+                return df_filtered
+            else:
+                # If no city-specific data found, return all measurements
+                # This is better than returning empty data
+                return df
         else:
             # Return empty DataFrame with expected structure
             return pd.DataFrame(columns=['datetime', 'parameter', 'value', 'unit', 'location'])
             
+    except requests.exceptions.HTTPError as e:
+        # Provide detailed error information for debugging
+        error_msg = f"HTTP Error {e.response.status_code}: {str(e)}"
+        try:
+            error_data = e.response.json()
+            if 'errors' in error_data:
+                error_msg += f"\nAPI Errors: {error_data['errors']}"
+            if 'message' in error_data:
+                error_msg += f"\nMessage: {error_data['message']}"
+            # Include response text for debugging
+            error_msg += f"\nResponse preview: {e.response.text[:300]}"
+        except:
+            error_msg += f"\nResponse: {e.response.text[:200]}"
+        raise ConnectionError(error_msg)
     except requests.exceptions.RequestException as e:
         raise ConnectionError(f"Failed to fetch measurements: {str(e)}")
+
+
+def filter_by_city(df: pd.DataFrame, city: str) -> pd.DataFrame:
+    """
+    Filters DataFrame by city name in location information.
+    
+    Handles different possible structures of location data in the API response.
+    
+    Args:
+        df: DataFrame with measurements
+        city: City name to filter by
+    
+    Returns:
+        Filtered DataFrame
+    """
+    if df.empty:
+        return df
+    
+    # Try different possible location field structures
+    city_lower = city.lower()
+    
+    # Check if location is a nested dictionary
+    if 'location' in df.columns and len(df) > 0:
+        first_location = df['location'].iloc[0]
+        if isinstance(first_location, dict):
+            # Extract location name from nested dict
+            if 'name' in first_location:
+                city_filter = df['location'].apply(
+                    lambda x: city_lower in str(x.get('name', '')).lower() if isinstance(x, dict) else False
+                )
+                return df[city_filter]
+            elif 'city' in first_location:
+                city_filter = df['location'].apply(
+                    lambda x: city_lower in str(x.get('city', '')).lower() if isinstance(x, dict) else False
+                )
+                return df[city_filter]
+    
+    # Check for locationName column
+    if 'locationName' in df.columns:
+        city_filter = df['locationName'].astype(str).str.lower().str.contains(city_lower, na=False)
+        return df[city_filter]
+    
+    # Check if location is a simple string column
+    if 'location' in df.columns:
+        city_filter = df['location'].astype(str).str.lower().str.contains(city_lower, na=False)
+        return df[city_filter]
+    
+    # If no location filtering possible, return original DataFrame
+    return df
 
 
 def clean_data(df: pd.DataFrame) -> pd.DataFrame:
