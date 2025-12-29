@@ -50,8 +50,10 @@ def fetch_measurements_direct(city: str, api_key: str) -> pd.DataFrame:
     """
     Fetches measurements directly from OpenAQ API v3 measurements endpoint.
     
-    This method fetches recent measurements and filters by city name in the location data.
-    This approach avoids the 422 error by using only supported parameters.
+    Uses a multi-step approach:
+    1. First, try to get locations for the city
+    2. Then fetch measurements for those specific locations
+    3. Fallback to direct measurements query if locations approach fails
     
     Args:
         city (str): City name
@@ -60,84 +62,153 @@ def fetch_measurements_direct(city: str, api_key: str) -> pd.DataFrame:
     Returns:
         pd.DataFrame: DataFrame with air quality measurements
     """
-    measurements_url = "https://api.openaq.org/v3/measurements"
-    
     headers = {
         'X-API-Key': api_key,
         'Content-Type': 'application/json'
     }
     
-    # Calculate date range for last 24 hours (ISO format)
-    date_from = (pd.Timestamp.now() - pd.Timedelta(days=1)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    # Strategy 1: Get locations first, then measurements for those locations
+    # This is more reliable because measurements endpoint often requires location_id
+    try:
+        locations = _get_locations_for_city(city, api_key, headers)
+        if locations:
+            return _get_measurements_for_locations(locations, api_key, headers)
+    except Exception as e:
+        # If location-based approach fails, try direct measurements
+        pass
+    
+    # Strategy 2: Try direct measurements endpoint with various parameter combinations
+    measurements_url = "https://api.openaq.org/v3/measurements"
+    
+    # Try different parameter combinations
+    strategies = [
+        # Try 1: Just limit (most basic)
+        {'limit': 50},
+        # Try 2: Limit with date_from (UTC format)
+        {
+            'limit': 50,
+            'date_from': (pd.Timestamp.now() - pd.Timedelta(days=1)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        },
+        # Try 3: Limit with date_from and date_to
+        {
+            'limit': 50,
+            'date_from': (pd.Timestamp.now() - pd.Timedelta(days=1)).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'date_to': pd.Timestamp.now().strftime('%Y-%m-%dT%H:%M:%SZ')
+        },
+    ]
+    
+    for i, params in enumerate(strategies, 1):
+        try:
+            response = requests.get(measurements_url, headers=headers, params=params, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                measurements = data.get('results', [])
+                if measurements:
+                    df = pd.DataFrame(measurements)
+                    df_filtered = filter_by_city(df, city)
+                    if not df_filtered.empty:
+                        return df_filtered
+                    # Return all if city filter finds nothing
+                    return df
+            
+            elif response.status_code == 422:
+                # Capture full error details for the last attempt
+                if i == len(strategies):
+                    error_data = response.json()
+                    error_details = error_data.get('errors', [])
+                    error_msg = f"API validation error (422): {error_data.get('message', 'Invalid parameters')}"
+                    if error_details:
+                        error_msg += f"\n\nDetailed Errors:\n{error_details}"
+                    error_msg += f"\n\nAttempted parameters: {params}"
+                    error_msg += f"\n\nFull response: {response.text[:500]}"
+                    raise ValueError(error_msg)
+                # Otherwise, try next strategy
+                continue
+            else:
+                response.raise_for_status()
+                
+        except requests.exceptions.RequestException as e:
+            if i == len(strategies):
+                # Last attempt failed, raise with full details
+                error_msg = f"Failed to fetch measurements after {len(strategies)} attempts: {str(e)}"
+                if hasattr(e, 'response') and e.response is not None:
+                    try:
+                        error_data = e.response.json()
+                        error_msg += f"\nAPI Response: {error_data}"
+                    except:
+                        error_msg += f"\nResponse text: {e.response.text[:300]}"
+                raise ConnectionError(error_msg)
+            continue
+    
+    # If all strategies failed
+    return pd.DataFrame(columns=['datetime', 'parameter', 'value', 'unit', 'location'])
+
+
+def _get_locations_for_city(city: str, api_key: str, headers: dict) -> list:
+    """
+    Helper function to get location IDs for a city.
+    Uses locations endpoint with minimal parameters.
+    """
+    locations_url = "https://api.openaq.org/v3/locations"
+    
+    # Try with just limit first
+    params = {'limit': 20}
     
     try:
-        # Use minimal, well-supported parameters to avoid 422 errors
-        # Start with basic parameters that are most likely to be supported
+        response = requests.get(locations_url, headers=headers, params=params, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            locations = data.get('results', [])
+            # Filter locations by city name in the response
+            city_locations = []
+            for loc in locations:
+                # Check various possible city fields
+                city_name = None
+                if isinstance(loc, dict):
+                    city_name = loc.get('city') or loc.get('name') or str(loc)
+                if city_name and city.lower() in str(city_name).lower():
+                    city_locations.append(loc)
+            return city_locations[:5]  # Limit to 5 locations
+    except:
+        pass
+    
+    return []
+
+
+def _get_measurements_for_locations(locations: list, api_key: str, headers: dict) -> pd.DataFrame:
+    """
+    Helper function to get measurements for specific locations.
+    """
+    measurements_url = "https://api.openaq.org/v3/measurements"
+    all_measurements = []
+    
+    date_from = (pd.Timestamp.now() - pd.Timedelta(days=1)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    
+    for loc in locations:
+        location_id = loc.get('id') if isinstance(loc, dict) else loc
+        if not location_id:
+            continue
+            
         params = {
+            'location_id': location_id,
             'limit': 100,
             'date_from': date_from
         }
         
-        response = requests.get(measurements_url, headers=headers, params=params, timeout=10)
-        
-        # If we get a 422 error, provide detailed error information
-        if response.status_code == 422:
-            try:
-                error_data = response.json()
-                error_details = error_data.get('errors', [])
-                error_msg = f"API validation error (422): {error_data.get('message', 'Invalid parameters')}"
-                if error_details:
-                    error_msg += f"\nDetails: {error_details}"
-                # Try with even simpler parameters
-                params_simple = {'limit': 50}
-                response_simple = requests.get(measurements_url, headers=headers, params=params_simple, timeout=10)
-                if response_simple.status_code == 200:
-                    # If simple request works, use it
-                    data = response_simple.json()
-                    measurements = data.get('results', [])
-                    if measurements:
-                        df = pd.DataFrame(measurements)
-                        return filter_by_city(df, city)
-                raise ValueError(error_msg)
-            except Exception as parse_error:
-                raise ValueError(f"API validation error (422). Response: {response.text[:200]}")
-        
-        response.raise_for_status()
-        
-        data = response.json()
-        measurements = data.get('results', [])
-        
-        if measurements:
-            df = pd.DataFrame(measurements)
-            # Filter by city name
-            df_filtered = filter_by_city(df, city)
-            
-            if not df_filtered.empty:
-                return df_filtered
-            else:
-                # If no city-specific data found, return all measurements
-                # This is better than returning empty data
-                return df
-        else:
-            # Return empty DataFrame with expected structure
-            return pd.DataFrame(columns=['datetime', 'parameter', 'value', 'unit', 'location'])
-            
-    except requests.exceptions.HTTPError as e:
-        # Provide detailed error information for debugging
-        error_msg = f"HTTP Error {e.response.status_code}: {str(e)}"
         try:
-            error_data = e.response.json()
-            if 'errors' in error_data:
-                error_msg += f"\nAPI Errors: {error_data['errors']}"
-            if 'message' in error_data:
-                error_msg += f"\nMessage: {error_data['message']}"
-            # Include response text for debugging
-            error_msg += f"\nResponse preview: {e.response.text[:300]}"
+            response = requests.get(measurements_url, headers=headers, params=params, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                measurements = data.get('results', [])
+                all_measurements.extend(measurements)
         except:
-            error_msg += f"\nResponse: {e.response.text[:200]}"
-        raise ConnectionError(error_msg)
-    except requests.exceptions.RequestException as e:
-        raise ConnectionError(f"Failed to fetch measurements: {str(e)}")
+            continue
+    
+    if all_measurements:
+        return pd.DataFrame(all_measurements)
+    
+    return pd.DataFrame(columns=['datetime', 'parameter', 'value', 'unit', 'location'])
 
 
 def filter_by_city(df: pd.DataFrame, city: str) -> pd.DataFrame:
