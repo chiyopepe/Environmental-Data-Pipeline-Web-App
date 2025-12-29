@@ -11,8 +11,50 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
+# Load environment variables from .env file (for local development)
 load_dotenv()
+
+
+def get_api_key() -> str:
+    """
+    Retrieves the OpenAQ API key from multiple sources.
+    
+    Priority order:
+    1. Streamlit secrets (for Streamlit Cloud deployment)
+    2. Environment variables (for local development or other platforms)
+    
+    Returns:
+        str: API key
+    
+    Raises:
+        ValueError: If API key is not found in any source
+    """
+    api_key = None
+    
+    # Try Streamlit secrets first (for Streamlit Cloud)
+    try:
+        import streamlit as st
+        if hasattr(st, 'secrets') and 'OPENAQ_API_KEY' in st.secrets:
+            api_key = st.secrets['OPENAQ_API_KEY']
+    except (ImportError, AttributeError):
+        # Streamlit not available or secrets not configured
+        pass
+    
+    # Fallback to environment variable (for local .env file or other platforms)
+    if not api_key:
+        api_key = os.getenv('OPENAQ_API_KEY')
+    
+    # Validate API key
+    if not api_key or api_key == 'your_key_here' or api_key.strip() == '':
+        error_msg = (
+            "API key not found. Please set OPENAQ_API_KEY:\n"
+            "- For Streamlit Cloud: Add it in Settings > Secrets\n"
+            "- For local development: Add it to your .env file\n"
+            "Get your API key from: https://openaq.org/"
+        )
+        raise ValueError(error_msg)
+    
+    return api_key.strip()
 
 
 def fetch_aqi_data(city: str) -> pd.DataFrame:
@@ -33,14 +75,8 @@ def fetch_aqi_data(city: str) -> pd.DataFrame:
                      - unit: Unit of measurement
                      - location: Location name
     """
-    # Load API key from environment variable
-    api_key = os.getenv('OPENAQ_API_KEY')
-    
-    if not api_key or api_key == 'your_key_here':
-        raise ValueError(
-            "API key not found. Please set OPENAQ_API_KEY in your .env file. "
-            "Get your API key from: https://openaq.org/"
-        )
+    # Load API key from multiple sources (Streamlit secrets or environment variables)
+    api_key = get_api_key()
     
     # Use the direct measurements endpoint (more reliable)
     return fetch_measurements_direct(city, api_key)
